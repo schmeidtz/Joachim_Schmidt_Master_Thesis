@@ -1,0 +1,330 @@
+import os
+import glob
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from collections import defaultdict
+
+ROLLING_AVERAGE_WINDOW = 1
+LOAD_THRESHOLD = 58.0
+PEEK_CF_TEST_DATA = (1, 2)  # Use 1, 2, (1, 2), or None for all PEEK-CF files.
+
+FONTSIZE = 30
+LEGENDSIZE = FONTSIZE * 0.9
+
+FIGSIZE = (14, 10)
+BACKGROUND_COLOR = "#ffffff"
+
+PLALINE = 3.0
+SPECIMENLINE = 3.5
+
+MATERIAL_COLORS = {
+    "PEEK_CF": "#BE0000",
+    "PPS_CF":  "#b35300",
+    "PA6_CF":  "#008484",
+    "PLA":     "#0d0d0d",
+}
+
+# Each temperature gets its own colour + line style for visual distinction
+TEMP_STYLES = {
+    "LOW":  {"color": "#1f77b4", "linestyle": "-"},    # blue
+    "Tg":   {"color": "#2ca02c", "linestyle": "--"},   # green
+    "HIGH": {"color": "#ff7f0e", "linestyle": ":"},    # orange
+    "N/A":  {"color": "#7f7f7f", "linestyle": "-"},    # grey
+}
+
+
+def _detect_temp(material_name):
+    """Extract temperature level from subfolder name."""
+    upper = material_name.upper()
+    if "HIGH" in upper:
+        return "HIGH"
+    if "TG" in upper:
+        return "Tg"
+    if "LOW" in upper:
+        return "LOW"
+    return "N/A"
+
+
+def _detect_temp_from_path(filepath, data_dir):
+    """Extract temperature level from any folder in the relative data path."""
+    rel = os.path.relpath(filepath, data_dir)
+    for part in rel.split(os.sep):
+        temp = _detect_temp(part)
+        if temp != "N/A":
+            return temp
+    return "N/A"
+
+
+def _detect_test_data(filepath, data_dir):
+    """Extract specimen/test number from folders like PEEK_CF_HIGH_1."""
+    rel = os.path.relpath(filepath, data_dir)
+    for part in rel.split(os.sep):
+        match = re.search(r"_(\d+)$", part)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _clean_label(group, temp):
+    """Human-readable label: 'PEEK CF (LOW)' instead of 'PEEK_CF_LOW'."""
+    name = group.replace("_", " ").replace("CF Creality", "CF – Creality").replace("CF", "CF")
+    if temp and temp != "N/A":
+        return f"{name} ({temp})"
+    return name
+
+
+class CompositePlotter:
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.datasets = []
+
+    def parse_files(self):
+        search_pattern = os.path.join(self.data_dir, '**', '*.txt')
+        file_list = glob.glob(search_pattern, recursive=True)
+        for file in file_list:
+            material, crosshead, load = self._parse_single_file(file)
+            if material is not None and len(crosshead) > 0:
+                zeroed_x, zeroed_y = self.zero_data(crosshead, load, threshold=LOAD_THRESHOLD)
+                self.datasets.append({
+                    'filename': os.path.basename(file),
+                    'material': material,
+                    'group': self._get_group(file),
+                    'temp': _detect_temp_from_path(file, self.data_dir),
+                    'test_data': _detect_test_data(file, self.data_dir),
+                    'crosshead': zeroed_x,
+                    'load_N': zeroed_y,
+                })
+
+    def _get_group(self, filepath):
+        rel = os.path.relpath(filepath, self.data_dir)
+        return rel.split(os.sep)[0]
+
+    def _parse_single_file(self, filepath):
+        material = os.path.basename(os.path.dirname(filepath))
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            data_start_idx = next(
+                i for i, line in enumerate(lines)
+                if "Crosshead" in line and "Load" in line
+            ) + 2
+            crosshead, load_kN = [], []
+            for line in lines[data_start_idx:]:
+                if line.strip():
+                    vals = line.strip().split()
+                    crosshead.append(float(vals[0].replace(',', '.')))
+                    load_kN.append(float(vals[1].replace(',', '.')))
+            return material, np.array(crosshead), np.array(load_kN) * 1000
+        except:
+            return None, None, None
+
+    def zero_data(self, x, y, threshold=LOAD_THRESHOLD):
+        idx = np.where(y > threshold)[0]
+        if len(idx) > 0:
+            start_idx = idx[0]
+            return x[start_idx:] - x[start_idx], y[start_idx:]
+        return x, y
+
+    def apply_rolling_avg(self, data, window=ROLLING_AVERAGE_WINDOW):
+        series = pd.Series(data)
+        return series.rolling(window=window, center=True).mean().ffill().bfill().values
+
+    # ── Aggregation ───────────────────────────────────────────────────────────
+
+    def _aggregate_by_temp(self, datasets, window_size):
+        """Group specimens by temperature, return mean + min/max envelope per temp.
+
+        Returns list of dicts: {temp, label, x, y_mean, y_min, y_max, peak_x, peak_y}
+        """
+        by_temp = defaultdict(list)
+        for d in datasets:
+            y_smooth = self.apply_rolling_avg(d['load_N'], window=window_size)
+            by_temp[d['temp']].append((d['crosshead'], y_smooth))
+
+        results = []
+        for temp, curves in by_temp.items():
+            # Interpolate all curves onto a common x grid
+            x_max = min(c[0][-1] for c in curves)
+            x_grid = np.linspace(0, x_max, 500)
+            y_interp = np.array([np.interp(x_grid, c[0], c[1]) for c in curves])
+
+            y_mean = y_interp.mean(axis=0)
+            y_min = y_interp.min(axis=0)
+            y_max = y_interp.max(axis=0)
+
+            peak_idx = np.argmax(y_mean)
+            results.append({
+                'temp': temp,
+                'x': x_grid,
+                'y_mean': y_mean,
+                'y_min': y_min,
+                'y_max': y_max,
+                'peak_x': x_grid[peak_idx],
+                'peak_y': y_mean[peak_idx],
+                'n_specimens': len(curves),
+            })
+        return results
+
+    # ── Per-axis plotting ─────────────────────────────────────────────────────
+
+    def _plot_on_ax(self, ax, datasets, window_size, group_name, ref_datasets=None):
+        """Plot individual specimen curves on an axis with PLA reference."""
+        pla_color = MATERIAL_COLORS["PLA"]
+
+        # PLA reference
+        if ref_datasets:
+            for d in ref_datasets:
+                y_smooth = self.apply_rolling_avg(d['load_N'], window=window_size)
+                ax.plot(d['crosshead'], y_smooth, color=pla_color, linewidth=PLALINE,
+                        linestyle='--', alpha=0.5, label='PLA (reference)')
+
+        # Individual specimen curves — coloured by temperature
+        for d in datasets:
+            y_smooth = self.apply_rolling_avg(d['load_N'], window=window_size)
+            style = TEMP_STYLES.get(d['temp'], TEMP_STYLES["N/A"])
+            tc = style["color"]
+            ls = style["linestyle"]
+            label = _clean_label(group_name, d['temp'])
+
+            ax.plot(d['crosshead'], y_smooth, color=tc, linewidth=SPECIMENLINE,
+                    linestyle=ls, label=label)
+
+
+            # Peak marker
+            max_idx = np.argmax(y_smooth)
+            peak_x = d['crosshead'][max_idx]
+            peak_y = y_smooth[max_idx]
+            ax.scatter(peak_x, peak_y, color=tc, s=35,
+                       zorder=5, edgecolors='white', linewidths=0.5)
+            ax.annotate(f"{peak_y:.0f} N", (peak_x, peak_y),
+                        textcoords="offset points", xytext=(5, 8), ha='left',
+                        fontsize=LEGENDSIZE, color=tc)
+
+        ax.set_facecolor(BACKGROUND_COLOR)
+        ax.set_xlabel("Corrected Displacement [mm]", fontsize=FONTSIZE)
+        ax.set_ylabel("Load [N]", fontsize=FONTSIZE)
+        ax.tick_params(axis='both', labelsize=LEGENDSIZE)
+
+        # De-duplicate legend
+        handles, labels = ax.get_legend_handles_labels()
+        seen, unique_h, unique_l = {}, [], []
+        for h, l in zip(handles, labels):
+            if l not in seen:
+                seen[l] = True
+                unique_h.append(h)
+                unique_l.append(l)
+        ax.legend(unique_h, unique_l, fontsize=LEGENDSIZE, loc='best')
+
+    # ── Combined panel for "All Materials" ────────────────────────────────────
+
+    def _plot_combined(self, ax, group_datasets, window_size, ref_datasets=None):
+        """All groups on one axis — one line per group×temp."""
+        pla_color = MATERIAL_COLORS["PLA"]
+        temp_order = ["LOW", "Tg", "HIGH", "N/A"]
+
+        if ref_datasets:
+            pla_agg = self._aggregate_by_temp(ref_datasets, window_size)
+            for agg in pla_agg:
+                ax.plot(agg['x'], agg['y_mean'], color=pla_color, linewidth=1.0,
+                        linestyle='--', alpha=0.5, label='PLA (reference)')
+
+        for group_name, datasets in group_datasets:
+            aggregated = self._aggregate_by_temp(datasets, window_size)
+            aggregated.sort(key=lambda a: temp_order.index(a['temp']) if a['temp'] in temp_order else 99)
+
+            for agg in aggregated:
+                style = TEMP_STYLES.get(agg['temp'], TEMP_STYLES["N/A"])
+                tc = style["color"]
+                ls = style["linestyle"]
+                label = _clean_label(group_name, agg['temp'])
+                ax.plot(agg['x'], agg['y_mean'], color=tc, linewidth=1.8,
+                        linestyle=ls, label=label)
+
+
+                ax.scatter(agg['peak_x'], agg['peak_y'], color=tc, s=35,
+                           zorder=5, edgecolors='white', linewidths=0.5)
+
+        ax.set_facecolor(BACKGROUND_COLOR)
+        ax.set_xlabel("Corrected Displacement [mm]", fontsize=FONTSIZE)
+        ax.set_ylabel("Load [N]", fontsize=FONTSIZE)
+        ax.tick_params(axis='both', labelsize=LEGENDSIZE)
+
+        handles, labels = ax.get_legend_handles_labels()
+        seen, unique_h, unique_l = {}, [], []
+        for h, l in zip(handles, labels):
+            if l not in seen:
+                seen[l] = True
+                unique_h.append(h)
+                unique_l.append(l)
+        ax.legend(unique_h, unique_l, fontsize=LEGENDSIZE, loc='best')
+
+    # ── Main entry point ──────────────────────────────────────────────────────
+
+    def _filter_by_test_data(self, datasets, test_data):
+        if test_data is None:
+            return datasets
+        if isinstance(test_data, (list, tuple, set)):
+            selected_tests = set(test_data)
+        else:
+            selected_tests = {test_data}
+        return [d for d in datasets if d.get('test_data') in selected_tests]
+
+    def plot_all_groups(self, exclude_pa6_orion=False, window_size=ROLLING_AVERAGE_WINDOW,
+                        peek_cf_test_data=None):
+        pla = [d for d in self.datasets if d['group'] == 'PLA']
+        peek = [d for d in self.datasets if d['group'] == 'PEEK_CF']
+        peek = self._filter_by_test_data(peek, peek_cf_test_data)
+        pps_cf = [d for d in self.datasets if d['group'] == 'PPS']
+        pa6_creality = [d for d in self.datasets if d['group'] == 'PA6_CF_Creality']
+        pa6_orion = [d for d in self.datasets if d['group'] == 'PA6_CF']
+
+        panels = [
+            (peek, "PEEK CF", "PEEK CF vs PLA Reference"),
+            (pps_cf, "PPS CF", "PPS CF vs PLA Reference"),
+            (pa6_creality, "PA6_CF_Creality", "PA6 CF vs PLA Reference"),
+        ]
+        if not exclude_pa6_orion:
+            panels.append((pa6_orion, "PA6_CF", "PA6 CF (Orion) vs PLA Reference"))
+
+        plt.rcParams.update({
+            "axes.facecolor": BACKGROUND_COLOR,
+            "figure.facecolor": BACKGROUND_COLOR,
+            "axes.edgecolor": "black",
+            "axes.labelcolor": "black",
+            "xtick.color": "black",
+            "ytick.color": "black",
+            "text.color": "black",
+            "axes.grid": True,
+            "grid.color": "#dddddd",
+            "grid.linewidth": 0.8,
+        })
+
+        for datasets, group_name, _ in panels:
+            fig, ax = plt.subplots(figsize=FIGSIZE, facecolor=BACKGROUND_COLOR)
+            self._plot_on_ax(ax, datasets, window_size, group_name,
+                             ref_datasets=pla)
+            fig.tight_layout()
+
+        # Combined panel
+        combined_groups = [(g, d) for d, g, _ in panels]
+        fig, ax = plt.subplots(figsize=FIGSIZE, facecolor=BACKGROUND_COLOR)
+        self._plot_combined(ax, combined_groups, window_size,
+                            ref_datasets=pla)
+        fig.tight_layout()
+
+        plt.show()
+
+
+if __name__ == "__main__":
+    PATH = "/Users/joachimschmidt/Library/CloudStorage/Dropbox/PhD/Papers/Component_Study_CIRP/Mechanical_Testing/Data"
+    EXCLUDE_PA6_ORION = False
+
+    p = CompositePlotter(PATH)
+    p.parse_files()
+    p.plot_all_groups(
+        exclude_pa6_orion=EXCLUDE_PA6_ORION,
+        window_size=ROLLING_AVERAGE_WINDOW,
+        peek_cf_test_data=PEEK_CF_TEST_DATA,
+    )
